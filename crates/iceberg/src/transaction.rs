@@ -33,7 +33,7 @@ use std::mem::discriminant;
 
 const INITIAL_SEQUENCE_NUMBER: i64 = 0;
 const META_ROOT_PATH: &str = "metadata";
-const MAIN_BRACNH: &str = "main";
+const MAIN_BRANCH: &str = "main";
 
 /// Table transaction.
 pub struct Transaction<'a> {
@@ -358,7 +358,7 @@ impl<'a> MergeSnapshotAction<'a> {
                 snapshot: new_snapshot,
             },
             TableUpdate::SetSnapshotRef {
-                ref_name: MAIN_BRACNH.to_string(),
+                ref_name: MAIN_BRANCH.to_string(),
                 reference: SnapshotReference::new(
                     new_snapshot_id,
                     SnapshotRetention::branch(None, None, None),
@@ -370,7 +370,7 @@ impl<'a> MergeSnapshotAction<'a> {
                 uuid: self.tx.table.metadata().uuid(),
             },
             TableRequirement::RefSnapshotIdMatch {
-                r#ref: MAIN_BRACNH.to_string(),
+                r#ref: MAIN_BRANCH.to_string(),
                 snapshot_id: self.parent_snapshot_id,
             },
         ])?;
@@ -470,7 +470,7 @@ mod tests {
         TableMetadata,
     };
     use crate::table::Table;
-    use crate::transaction::{Transaction, MAIN_BRACNH};
+    use crate::transaction::{Transaction, MAIN_BRANCH};
     use crate::{TableIdent, TableRequirement, TableUpdate};
     use std::collections::HashMap;
     use std::fs::File;
@@ -657,7 +657,7 @@ mod tests {
             .unwrap_or(0);
         assert!(
             matches!(&tx.updates[0], TableUpdate::AddSnapshot { snapshot } if snapshot.snapshot_id() == new_snapshot_id)
-                && matches!(&tx.updates[1], TableUpdate::SetSnapshotRef { reference,ref_name } if reference.snapshot_id == new_snapshot_id && ref_name == MAIN_BRACNH),
+                && matches!(&tx.updates[1], TableUpdate::SetSnapshotRef { reference,ref_name } if reference.snapshot_id == new_snapshot_id && ref_name == MAIN_BRANCH),
         );
         assert_eq!(
             vec![
@@ -665,7 +665,7 @@ mod tests {
                     uuid: tx.table.metadata().uuid()
                 },
                 TableRequirement::RefSnapshotIdMatch {
-                    r#ref: MAIN_BRACNH.to_string(),
+                    r#ref: MAIN_BRANCH.to_string(),
                     snapshot_id: tx.table.metadata().current_snapshot_id
                 }
             ],
