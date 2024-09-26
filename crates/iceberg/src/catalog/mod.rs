@@ -960,7 +960,7 @@ mod tests {
                 .with_schema_id(1)
                 .with_summary(Summary {
                     operation: Operation::Append,
-                    other: HashMap::default(),
+                    additional_properties: HashMap::default(),
                 })
                 .build(),
         };
