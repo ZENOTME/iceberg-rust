@@ -18,21 +18,21 @@
 //! This module contains transaction api.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::mem::discriminant;
 use std::ops::RangeFrom;
-use std::sync::Arc;
+use std::pin::Pin;
 
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::io::OutputFile;
+use crate::io::FileIO;
 use crate::spec::{
     BoundPartitionSpec, DataFile, DataFileFormat, FormatVersion, Manifest, ManifestEntry,
-    ManifestFile, ManifestListWriter, ManifestMetadata, ManifestWriter, NullOrder, Operation,
-    Schema, Snapshot, SnapshotReference, SnapshotRetention, SortDirection, SortField, SortOrder,
-    Struct, StructType, Summary, Transform, MAIN_BRANCH,
+    ManifestFile, ManifestListWriter, ManifestMetadata, ManifestStatus, ManifestWriter, NullOrder,
+    Operation, SchemaRef, Snapshot, SnapshotReference, SnapshotRetention, SortDirection, SortField,
+    SortOrder, Struct, StructType, Summary, Transform, MAIN_BRANCH,
 };
 use crate::table::Table;
 use crate::TableUpdate::UpgradeFormatVersion;
@@ -143,10 +143,9 @@ impl<'a> Transaction<'a> {
             .current_snapshot()
             .map(|s| s.snapshot_id());
         let snapshot_id = self.generate_unique_snapshot_id();
-        let schema = self.table.metadata().current_schema().as_ref().clone();
+        let schema = self.table.metadata().current_schema().clone();
         let schema_id = schema.schema_id();
         let format_version = self.table.metadata().format_version();
-        let partition_spec = self.table.metadata().default_partition_spec().clone();
         let commit_uuid = commit_uuid.unwrap_or_else(Uuid::new_v4);
 
         FastAppendAction::new(
@@ -156,7 +155,6 @@ impl<'a> Transaction<'a> {
             schema,
             schema_id,
             format_version,
-            partition_spec,
             key_metadata,
             commit_uuid,
             HashMap::new(),
@@ -200,10 +198,9 @@ impl<'a> FastAppendAction<'a> {
         tx: Transaction<'a>,
         parent_snapshot_id: Option<i64>,
         snapshot_id: i64,
-        schema: Schema,
+        schema: SchemaRef,
         schema_id: i32,
         format_version: FormatVersion,
-        partition_spec: Arc<BoundPartitionSpec>,
         key_metadata: Vec<u8>,
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
@@ -215,7 +212,6 @@ impl<'a> FastAppendAction<'a> {
                 parent_snapshot_id,
                 schema_id,
                 format_version,
-                partition_spec,
                 schema,
                 key_metadata,
                 commit_uuid,
@@ -298,13 +294,281 @@ trait SnapshotProduceOperation: Send + Sync {
 struct DefaultManifestProcess;
 
 impl ManifestProcess for DefaultManifestProcess {
-    fn process_manifeset(&self, manifests: Vec<ManifestFile>) -> Vec<ManifestFile> {
-        manifests
+    async fn process_manifeset<'a>(
+        &self,
+        _snapshot_producer: &mut SnapshotProduceAction<'a>,
+        manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<ManifestFile>> {
+        Ok(manifests)
+    }
+}
+
+use std::iter::Iterator;
+use std::marker::PhantomData;
+
+use itertools::Itertools;
+
+struct Bin<T> {
+    bin_weight: u32,
+    target_weight: u32,
+    items: Vec<T>,
+}
+
+impl<T> Bin<T> {
+    pub fn new(target_weight: u32) -> Self {
+        Bin {
+            bin_weight: 0,
+            target_weight,
+            items: Vec::new(),
+        }
+    }
+
+    pub fn can_add(&self, weight: u32) -> bool {
+        self.bin_weight + weight <= self.target_weight
+    }
+
+    pub fn add(&mut self, item: T, weight: u32) {
+        self.bin_weight += weight;
+        self.items.push(item);
+    }
+
+    pub fn into_vec(self) -> Vec<T> {
+        self.items
+    }
+}
+
+struct ListPacker<T> {
+    target_weight: u32,
+    _marker: PhantomData<T>,
+}
+
+impl<T> ListPacker<T> {
+    pub fn new(target_weight: u32) -> Self {
+        ListPacker {
+            target_weight,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn pack<F>(&self, items: Vec<T>, weight_func: F) -> Vec<Vec<T>>
+    where F: Fn(&T) -> u32 {
+        let mut bins: Vec<Bin<T>> = vec![];
+        for item in items {
+            let cur_weight = weight_func(&item);
+            let addable_bin = if let Some(bin) = bins.iter_mut().find(|bin| bin.can_add(cur_weight))
+            {
+                bin
+            } else {
+                bins.push(Bin::new(self.target_weight));
+                bins.last_mut().unwrap()
+            };
+            addable_bin.add(item, cur_weight);
+        }
+
+        bins.into_iter().map(|bin| bin.into_vec()).collect_vec()
+    }
+}
+
+struct MergeManifsetProcess {
+    target_size_bytes: u32,
+    min_count_to_merge: u32,
+}
+
+impl MergeManifsetProcess {
+    pub fn new(target_size_bytes: u32, min_count_to_merge: u32) -> Self {
+        Self {
+            target_size_bytes,
+            min_count_to_merge,
+        }
+    }
+
+    fn group_by_spec(&self, manifests: Vec<ManifestFile>) -> BTreeMap<i32, Vec<ManifestFile>> {
+        let mut grouped_manifests = BTreeMap::new();
+        for manifest in manifests {
+            grouped_manifests
+                .entry(manifest.partition_spec_id)
+                .or_insert_with(Vec::new)
+                .push(manifest);
+        }
+        grouped_manifests
+    }
+
+    async fn merge_bin(
+        &self,
+        snapshot_id: i64,
+        file_io: FileIO,
+        manifest_bin: Vec<ManifestFile>,
+        writer: ManifestWriter,
+        manifest_meta: ManifestMetadata,
+    ) -> Result<ManifestFile> {
+        let add_entry = |entry: &ManifestEntry| -> ManifestEntry {
+            if entry.sequence_number().is_some_and(|n| n >= 0) {
+                ManifestEntry::builder()
+                    .status(ManifestStatus::Added)
+                    .snapshot_id(Some(snapshot_id))
+                    .sequence_number(entry.sequence_number())
+                    .data_file(entry.data_file().clone())
+                    .build()
+            } else {
+                ManifestEntry::builder()
+                    .status(ManifestStatus::Added)
+                    .snapshot_id(Some(snapshot_id))
+                    .data_file(entry.data_file().clone())
+                    .build()
+            }
+        };
+        let delete_entry = |entry: &ManifestEntry| -> ManifestEntry {
+            let builder = ManifestEntry::builder()
+                .status(ManifestStatus::Deleted)
+                .snapshot_id(Some(snapshot_id))
+                .sequence_number(entry.sequence_number())
+                .file_sequence_number(entry.file_sequence_numver())
+                .data_file(entry.data_file().clone());
+            builder.build()
+        };
+        let existing_entry = |entry: &ManifestEntry| -> ManifestEntry {
+            let builder = ManifestEntry::builder()
+                .status(ManifestStatus::Existing)
+                .snapshot_id(entry.snapshot_id())
+                .sequence_number(entry.sequence_number())
+                .file_sequence_number(entry.file_sequence_numver())
+                .data_file(entry.data_file().clone());
+            builder.build()
+        };
+
+        let mut new_manifest_entires = vec![];
+        for manifset_file in manifest_bin {
+            let manifest_file = manifset_file.load_manifest(&file_io).await?;
+            for manifest_entry in manifest_file.entries() {
+                if manifest_entry.status() == ManifestStatus::Deleted
+                    && manifest_entry
+                        .snapshot_id()
+                        .is_some_and(|id| id == snapshot_id)
+                {
+                    //only files deleted by this snapshot should be added to the new manifest
+                    new_manifest_entires.push(delete_entry(manifest_entry));
+                } else if manifest_entry.status() == ManifestStatus::Added
+                    && manifest_entry
+                        .snapshot_id()
+                        .is_some_and(|id| id == snapshot_id)
+                {
+                    //added entries from this snapshot are still added, otherwise they should be existing
+                    new_manifest_entires.push(add_entry(manifest_entry));
+                } else if manifest_entry.status() != ManifestStatus::Deleted {
+                    // add all non-deleted files from the old manifest as existing files
+                    new_manifest_entires.push(existing_entry(manifest_entry));
+                }
+            }
+        }
+
+        let manifest = Manifest::new(manifest_meta, new_manifest_entires);
+        writer.write(manifest).await
+    }
+
+    async fn merge_group<'a>(
+        &self,
+        snapshot_produce: &mut SnapshotProduceAction<'a>,
+        first_manifest: &ManifestFile,
+        spec_id: i32,
+        group_manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<ManifestFile>> {
+        let packer: ListPacker<ManifestFile> = ListPacker::new(self.target_size_bytes);
+        let manifest_bins =
+            packer.pack(group_manifests, |manifest| manifest.manifest_length as u32);
+
+        let manifest_merge_futures = manifest_bins
+            .into_iter()
+            .map(|manifest_bin| {
+                if manifest_bin.len() == 1 {
+                    Ok(Box::pin(async { Ok(manifest_bin) })
+                        as Pin<
+                            Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>,
+                        >)
+                }
+                //  if the bin has the first manifest (the new data files or an appended manifest file) then only
+                //  merge it if the number of manifests is above the minimum count. this is applied only to bins
+                //  with an in-memory manifest so that large manifests don't prevent merging older groups.
+                else if manifest_bin
+                    .iter()
+                    .any(|manifest| manifest == first_manifest)
+                    && manifest_bin.len() < self.min_count_to_merge as usize
+                {
+                    Ok(Box::pin(async { Ok(manifest_bin) })
+                        as Pin<
+                            Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>,
+                        >)
+                } else {
+                    let writer = snapshot_produce.new_manifest_writer()?;
+                    let manifest_meta = snapshot_produce.new_manifest_meta(snapshot_produce.tx.table.metadata().partition_spec_by_id(spec_id).ok_or_else(||Error::new(ErrorKind::DataInvalid, "Invalid spec id in manifest entry"))?.as_ref().clone().bind(snapshot_produce.tx.table.metadata().current_schema().clone())?);
+                    let snapshot_id = snapshot_produce.snapshot_id;
+                    let file_io = snapshot_produce.tx.table.file_io().clone();
+                    Ok((Box::pin(async move {
+                        Ok(vec![
+                            self.merge_bin(
+                                snapshot_id,
+                                file_io,
+                                manifest_bin,
+                                writer,
+                                manifest_meta,
+                            )
+                            .await?,
+                        ])
+                    }))
+                        as Pin<Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>>)
+                }
+            })
+            .collect::<Result<Vec<Pin<Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>>>>>()?;
+
+        let merged_bins: Vec<Vec<ManifestFile>> =
+            futures::future::join_all(manifest_merge_futures.into_iter())
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+
+        Ok(merged_bins.into_iter().flatten().collect())
+    }
+
+    async fn merge_manifeset<'a>(
+        &self,
+        snapshot_produce: &mut SnapshotProduceAction<'a>,
+        manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<ManifestFile>> {
+        if manifests.is_empty() {
+            return Ok(manifests);
+        }
+
+        let first_manifest = manifests[0].clone();
+
+        let group_manifests = self.group_by_spec(manifests);
+
+        let mut merge_manifests = vec![];
+        for (spec_id, manifests) in group_manifests.into_iter().rev() {
+            merge_manifests.extend(
+                self.merge_group(snapshot_produce, &first_manifest, spec_id, manifests)
+                    .await?,
+            );
+        }
+
+        Ok(merge_manifests)
+    }
+}
+
+impl ManifestProcess for MergeManifsetProcess {
+    async fn process_manifeset<'a>(
+        &self,
+        snapshot_produce: &mut SnapshotProduceAction<'a>,
+        manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<ManifestFile>> {
+        self.merge_manifeset(snapshot_produce, manifests).await
     }
 }
 
 trait ManifestProcess: Send + Sync {
-    fn process_manifeset(&self, manifests: Vec<ManifestFile>) -> Vec<ManifestFile>;
+    fn process_manifeset<'a>(
+        &self,
+        snapshot_produce: &mut SnapshotProduceAction<'a>,
+        manifests: Vec<ManifestFile>,
+    ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
 }
 
 struct SnapshotProduceAction<'a> {
@@ -314,8 +578,7 @@ struct SnapshotProduceAction<'a> {
     snapshot_id: i64,
     schema_id: i32,
     format_version: FormatVersion,
-    partition_spec: Arc<BoundPartitionSpec>,
-    schema: Schema,
+    schema: SchemaRef,
     key_metadata: Vec<u8>,
 
     commit_uuid: Uuid,
@@ -337,8 +600,7 @@ impl<'a> SnapshotProduceAction<'a> {
         parent_snapshot_id: Option<i64>,
         schema_id: i32,
         format_version: FormatVersion,
-        partition_spec: Arc<BoundPartitionSpec>,
-        schema: Schema,
+        schema: SchemaRef,
         key_metadata: Vec<u8>,
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
@@ -353,7 +615,6 @@ impl<'a> SnapshotProduceAction<'a> {
             snapshot_properties,
             added_data_files: vec![],
             manifest_counter: (0..),
-            partition_spec,
             schema,
             key_metadata,
         })
@@ -405,14 +666,28 @@ impl<'a> SnapshotProduceAction<'a> {
             }
             Self::validate_partition_value(
                 data_file.partition(),
-                self.partition_spec.partition_type(),
+                self.tx
+                    .table
+                    .metadata()
+                    .default_partition_spec()
+                    .partition_type(),
             )?;
         }
         self.added_data_files.extend(data_files);
         Ok(self)
     }
 
-    fn new_manifest_output(&mut self) -> Result<OutputFile> {
+    fn new_manifest_meta(&mut self, partition_spec: BoundPartitionSpec) -> ManifestMetadata {
+        ManifestMetadata::builder()
+            .schema(self.schema.clone())
+            .schema_id(self.schema_id)
+            .format_version(self.format_version)
+            .partition_spec(partition_spec)
+            .content(crate::spec::ManifestContentType::Data)
+            .build()
+    }
+
+    fn new_manifest_writer(&mut self) -> Result<ManifestWriter> {
         let new_manifest_path = format!(
             "{}/{}/{}-m{}.{}",
             self.tx.table.metadata().location(),
@@ -421,7 +696,12 @@ impl<'a> SnapshotProduceAction<'a> {
             self.manifest_counter.next().unwrap(),
             DataFileFormat::Avro
         );
-        self.tx.table.file_io().new_output(new_manifest_path)
+        let output_file = self.tx.table.file_io().new_output(new_manifest_path)?;
+        Ok(ManifestWriter::new(
+            output_file,
+            self.snapshot_id,
+            self.key_metadata.clone(),
+        ))
     }
 
     // Write manifest file for added data files and return the ManifestFile for ManifestList.
@@ -434,7 +714,7 @@ impl<'a> SnapshotProduceAction<'a> {
                     .status(crate::spec::ManifestStatus::Added)
                     .data_file(data_file);
                 if self.format_version as u8 == 1u8 {
-                    builder.snapshot_id(self.snapshot_id).build()
+                    builder.snapshot_id(Some(self.snapshot_id)).build()
                 } else {
                     // For format version > 1, we set the snapshot id at the inherited time to avoid rewrite the manifest file when
                     // commit failed.
@@ -442,19 +722,10 @@ impl<'a> SnapshotProduceAction<'a> {
                 }
             })
             .collect();
-        let manifest_meta = ManifestMetadata::builder()
-            .schema(self.schema.clone().into())
-            .schema_id(self.schema_id)
-            .format_version(self.format_version)
-            .partition_spec(self.partition_spec.as_ref().clone())
-            .content(crate::spec::ManifestContentType::Data)
-            .build();
+        let manifest_meta =
+            self.new_manifest_meta(self.tx.table.metadata().default_spec.as_ref().clone());
         let manifest = Manifest::new(manifest_meta, manifest_entries);
-        let writer = ManifestWriter::new(
-            self.new_manifest_output()?,
-            self.snapshot_id,
-            self.key_metadata.clone(),
-        );
+        let writer = self.new_manifest_writer()?;
         writer.write(manifest).await
     }
 
@@ -468,8 +739,9 @@ impl<'a> SnapshotProduceAction<'a> {
 
         let mut manifest_files = vec![added_manifest];
         manifest_files.extend(existing_manifests);
-        let manifest_files = manifest_process.process_manifeset(manifest_files);
-        Ok(manifest_files)
+        manifest_process
+            .process_manifeset(self, manifest_files)
+            .await
     }
 
     // # TODO

@@ -1079,9 +1079,9 @@ mod tests {
                         .build(),
                     ManifestEntry::builder()
                         .status(ManifestStatus::Deleted)
-                        .snapshot_id(parent_snapshot.snapshot_id())
-                        .sequence_number(parent_snapshot.sequence_number())
-                        .file_sequence_number(parent_snapshot.sequence_number())
+                        .snapshot_id(Some(parent_snapshot.snapshot_id()))
+                        .sequence_number(Some(parent_snapshot.sequence_number()))
+                        .file_sequence_number(Some(parent_snapshot.sequence_number()))
                         .data_file(
                             DataFileBuilder::default()
                                 .content(DataContentType::Data)
@@ -1096,9 +1096,9 @@ mod tests {
                         .build(),
                     ManifestEntry::builder()
                         .status(ManifestStatus::Existing)
-                        .snapshot_id(parent_snapshot.snapshot_id())
-                        .sequence_number(parent_snapshot.sequence_number())
-                        .file_sequence_number(parent_snapshot.sequence_number())
+                        .snapshot_id(Some(parent_snapshot.snapshot_id()))
+                        .sequence_number(Some(parent_snapshot.sequence_number()))
+                        .file_sequence_number(Some(parent_snapshot.sequence_number()))
                         .data_file(
                             DataFileBuilder::default()
                                 .content(DataContentType::Data)

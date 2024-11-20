@@ -821,19 +821,19 @@ pub struct ManifestEntry {
     ///
     /// Snapshot id where the file was added, or deleted if status is 2.
     /// Inherited when null.
-    #[builder(default, setter(strip_option))]
+    #[builder(default)]
     snapshot_id: Option<i64>,
     /// field id: 3
     ///
     /// Data sequence number of the file.
     /// Inherited when null and status is 1 (added).
-    #[builder(default, setter(strip_option))]
+    #[builder(default)]
     sequence_number: Option<i64>,
     /// field id: 4
     ///
     /// File sequence number indicating when the file was added.
     /// Inherited when null and status is 1 (added).
-    #[builder(default, setter(strip_option))]
+    #[builder(default)]
     file_sequence_number: Option<i64>,
     /// field id: 2
     ///
@@ -922,6 +922,12 @@ impl ManifestEntry {
     #[inline]
     pub fn data_file(&self) -> &DataFile {
         &self.data_file
+    }
+
+    /// get file sequence number
+    #[inline]
+    pub fn file_sequence_numver(&self) -> Option<i64> {
+        self.file_sequence_number
     }
 }
 
